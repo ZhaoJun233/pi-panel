@@ -1,0 +1,86 @@
+{
+  "name": "pi-panel",
+  "displayName": "Pi Panel",
+  "description": "在 VS Code 侧边栏以聊天面板使用 Pi coding agent（基于 pi --mode rpc）",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "pi",
+    "coding-agent",
+    "chat",
+    "ai",
+    "rpc"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:piChatView",
+    "onView:piChatViewAux"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "pi-panel",
+          "title": "Pi",
+          "icon": "media/pi-icon.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "pi-panel-aux",
+          "title": "Pi",
+          "icon": "media/pi-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "pi-panel": [
+        {
+          "id": "piChatView",
+          "name": "Pi Chat",
+          "type": "webview"
+        }
+      ],
+      "pi-panel-aux": [
+        {
+          "id": "piChatViewAux",
+          "name": "Pi Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "pi-panel.focus",
+        "title": "Pi: 打开聊天面板",
+        "icon": "media/pi-icon.svg"
+      },
+      {
+        "command": "pi-panel.newSession",
+        "title": "Pi: 新会话",
+        "icon": "$(add)"
+      },
+      {
+        "command": "pi-panel.abort",
+        "title": "Pi: 停止",
+        "icon": "$(debug-stop)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "pi-panel.focus",
+          "group": "navigation"
+        }
+      ]
+    }
+  }
+}
