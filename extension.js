@@ -4,6 +4,7 @@
 
 const vscode = require('vscode');
 const { spawn } = require('child_process');
+const { StringDecoder } = require('string_decoder');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -16,6 +17,8 @@ class PiRpcClient {
     this.cwd = cwd;
     this.onEvent = onEvent;
     this.child = null;
+    this.decoder = new StringDecoder('utf8');
+    this.stderrDecoder = new StringDecoder('utf8');
     this.buffer = '';
     this.pending = new Map();
     this.seq = 0;
@@ -50,20 +53,41 @@ class PiRpcClient {
     this.child = child;
 
     child.stdout.on('data', (d) => this._onData(d));
-    child.stderr.on('data', (d) => this.onEvent({ type: 'stderr', text: d.toString() }));
-    child.on('exit', (code, signal) => this.onEvent({ type: 'exit', code, signal }));
-    child.on('error', (err) =>
+    child.stderr.on('data', (d) => {
+      const text = this.stderrDecoder.write(d);
+      if (text) {
+        this.onEvent({ type: 'stderr', text });
+      }
+    });
+    child.on('exit', (code, signal) => {
+      this._rejectAllPending(new Error(`Pi 进程已退出 (code=${code})`));
+      this.onEvent({ type: 'exit', code, signal });
+    });
+    child.on('error', (err) => {
+      this._rejectAllPending(err);
       this.onEvent({
         type: 'spawn_error',
         message: err.message,
         command: cmd,
         hint: err.code === 'ENOENT' ? `找不到命令 "${cmd}"，请确认已安装 pi 并在 PATH 中。` : undefined,
-      })
-    );
+      });
+    });
+  }
+
+  _rejectAllPending(err) {
+    const error = err instanceof Error ? err : new Error(String(err || 'Pi 进程异常终止'));
+    for (const [id, entry] of this.pending.entries()) {
+      try {
+        entry.reject(error);
+      } catch {
+        /* ignore */
+      }
+    }
+    this.pending.clear();
   }
 
   _onData(d) {
-    this.buffer += d.toString();
+    this.buffer += this.decoder.write(d);
     let idx;
     while ((idx = this.buffer.indexOf('\n')) !== -1) {
       const line = this.buffer.slice(0, idx).replace(/\r$/, '');
@@ -93,15 +117,42 @@ class PiRpcClient {
     this.onEvent(msg);
   }
 
-  send(cmd) {
+  send(cmd, timeoutMs) {
     return new Promise((resolve, reject) => {
       if (!cmd.id) cmd.id = 'r' + ++this.seq;
-      this.pending.set(cmd.id, { resolve, reject });
+      const cmdId = cmd.id;
+      let timer = null;
+      // 默认 30s 超时；prompt 交互耗时可能很长，不设置短超时
+      const effectiveTimeout = timeoutMs !== undefined ? timeoutMs : (cmd.type === 'prompt' ? 0 : 30000);
+      if (effectiveTimeout > 0) {
+        timer = setTimeout(() => {
+          if (this.pending.has(cmdId)) {
+            this.pending.delete(cmdId);
+            reject(new Error(`RPC 请求超时: ${cmd.type || cmd.command || 'unknown'} (${effectiveTimeout}ms)`));
+          }
+        }, effectiveTimeout);
+      }
+
+      this.pending.set(cmdId, {
+        resolve: (val) => {
+          if (timer) clearTimeout(timer);
+          resolve(val);
+        },
+        reject: (err) => {
+          if (timer) clearTimeout(timer);
+          reject(err);
+        },
+      });
+
       const line = JSON.stringify(cmd) + '\n';
       try {
+        if (!this.child || !this.child.stdin || this.child.killed) {
+          throw new Error('Pi 进程未运行或已终止');
+        }
         this.child.stdin.write(line);
       } catch (e) {
-        this.pending.delete(cmd.id);
+        if (timer) clearTimeout(timer);
+        this.pending.delete(cmdId);
         reject(e);
       }
     });
@@ -109,15 +160,30 @@ class PiRpcClient {
 
   sendUiResponse(id, payload) {
     try {
-      this.child.stdin.write(JSON.stringify({ type: 'extension_ui_response', id, ...payload }) + '\n');
+      if (this.child && this.child.stdin) {
+        this.child.stdin.write(JSON.stringify({ type: 'extension_ui_response', id, ...payload }) + '\n');
+      }
     } catch {
       /* ignore */
     }
   }
 
   stop() {
+    this._rejectAllPending(new Error('RPC 客户端主动停止'));
+    if (!this.child) return;
+    const child = this.child;
+    this.child = null;
     try {
-      this.child && this.child.kill();
+      if (process.platform === 'win32' && child.pid) {
+        try {
+          const { execSync } = require('child_process');
+          execSync(`taskkill /pid ${child.pid} /T /F`, { stdio: 'ignore' });
+        } catch {
+          child.kill();
+        }
+      } else {
+        child.kill();
+      }
     } catch {
       /* ignore */
     }
@@ -128,32 +194,47 @@ class PiRpcClient {
 // UI 状态与消息归一化
 // ---------------------------------------------------------------------------
 function normalizeMessage(msg) {
-  // AgentMessage -> UI 消息
-  const content = Array.isArray(msg.content) ? msg.content : [];
+  if (!msg) return { role: 'assistant', text: '', thinking: '', toolCalls: [], done: true };
   const ui = {
+    id: msg.id || '',
     role: msg.role,
     text: '',
     thinking: '',
     toolCalls: [],
+    errorMessage: msg.errorMessage || '',
+    stopReason: msg.stopReason || '',
     done: true,
   };
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue;
-    if (block.type === 'text') ui.text += block.text || '';
-    else if (block.type === 'thinking') ui.thinking += block.thinking || '';
-    else if (block.type === 'toolCall') {
-      ui.toolCalls.push({
-        id: block.id || '',
-        name: block.name || block.toolName || 'tool',
-        args: JSON.stringify(block.arguments ?? block.input ?? {}),
-        output: '',
-      });
-    } else if (block.type === 'toolResult') {
-      const text = (Array.isArray(block.content) ? block.content : [])
-        .map((c) => (c && c.text) || '')
-        .join('\n');
-      ui.toolCalls.push({ id: block.toolUseId || '', name: 'toolResult', args: '', output: text });
+
+  if (typeof msg.content === 'string') {
+    ui.text = msg.content;
+  } else if (Array.isArray(msg.content)) {
+    for (const block of msg.content) {
+      if (!block) continue;
+      if (typeof block === 'string') {
+        ui.text += block;
+      } else if (typeof block === 'object') {
+        if (block.type === 'text') {
+          ui.text += block.text || '';
+        } else if (block.type === 'thinking') {
+          ui.thinking += block.thinking || '';
+        } else if (block.type === 'toolCall') {
+          ui.toolCalls.push({
+            id: block.id || '',
+            name: block.name || block.toolName || 'tool',
+            args: typeof block.arguments === 'string' ? block.arguments : JSON.stringify(block.arguments ?? block.input ?? {}),
+            output: '',
+          });
+        } else if (block.type === 'toolResult') {
+          const text = (Array.isArray(block.content) ? block.content : (typeof block.content === 'string' ? [{ text: block.content }] : []))
+            .map((c) => (c && c.text) || '')
+            .join('\n');
+          ui.toolCalls.push({ id: block.toolCallId || block.toolUseId || '', name: 'toolResult', args: '', output: text });
+        }
+      }
     }
+  } else if (typeof msg.text === 'string') {
+    ui.text = msg.text;
   }
   return ui;
 }
@@ -165,7 +246,7 @@ function blockToUiMessage(blocks) {
     if (b.type === 'text') ui.text += b.text || '';
     else if (b.type === 'thinking') ui.thinking += b.thinking || '';
     else if (b.type === 'toolcall') {
-      ui.toolCalls.push({ id: b.id || '', name: b.name || 'tool', args: b.args || '', output: '' });
+      ui.toolCalls.push({ id: b.id || '', name: b.name || 'tool', args: b.args || '', output: b.output || '' });
     }
   });
   return ui;
@@ -177,10 +258,12 @@ function blockToUiMessage(blocks) {
 class PiPanel {
   constructor() {
     this.client = null;
-    this.webviewView = null;
+    this.currentEpoch = 0;
+    this.webviews = new Set();
     this.state = {
       status: 'idle', // starting | idle | streaming | error
       statusText: '',
+      errorDetail: '',
       model: '',
       thinkingLevel: '',
       availableLevels: [],
@@ -194,12 +277,35 @@ class PiPanel {
     };
   }
 
-  start(cwd) {
+  get webviewView() {
+    return this.webviews.values().next().value || null;
+  }
+
+  set webviewView(v) {
+    if (v) this.addWebview(v);
+  }
+
+  addWebview(view) {
+    this.webviews.add(view);
+    if (typeof view.onDidDispose === 'function') {
+      view.onDidDispose(() => {
+        this.webviews.delete(view);
+      });
+    }
+    this._push();
+  }
+
+  start(cwd, expectedEpoch) {
     if (this.client) return;
+    const epoch = expectedEpoch !== undefined ? expectedEpoch : ++this.currentEpoch;
+    this.currentEpoch = epoch;
     this.state.status = 'starting';
     this.state.statusText = '正在启动 Pi…';
     this._push();
-    this.client = new PiRpcClient(cwd, (evt) => this._onEvent(evt));
+    this.client = new PiRpcClient(cwd, (evt) => {
+      if (this.currentEpoch !== epoch) return;
+      this._onEvent(evt);
+    });
     this.client.start();
   }
 
@@ -225,6 +331,11 @@ class PiPanel {
           const m = evt.data.model;
           this.state.model = m ? `${m.provider}/${m.id}` : '';
           this.state.thinkingLevel = evt.data.thinkingLevel || '';
+          if (this.state.status === 'starting') {
+            this.state.status = 'idle';
+            this.state.statusText = '';
+          }
+          this._push();
         }
         break;
       }
@@ -237,11 +348,30 @@ class PiPanel {
         this.state.status = 'idle';
         this.state.statusText = '';
         this._push();
+        // 自动拉取最新的 get_session_stats 刷新 Context 状态
+        if (this.client) {
+          this.client
+            .send({ type: 'get_session_stats' })
+            .then((res) => {
+              if (res.success && res.data) {
+                this.state.contextUsage = res.data.contextUsage || null;
+                this._push();
+              }
+            })
+            .catch(() => {});
+        }
         break;
       case 'message_start': {
         const role = evt.message && evt.message.role;
         if (role === 'user') {
-          this.state.messages.push(normalizeMessage(evt.message));
+          const ui = normalizeMessage(evt.message);
+          // 查找是否已有匹配或待确认的最后一个 user 消息（例如 send 乐观插入的）
+          const lastMsg = this.state.messages[this.state.messages.length - 1];
+          if (lastMsg && lastMsg.role === 'user' && (!lastMsg.id || lastMsg.id === ui.id || !ui.id || lastMsg.text === ui.text || lastMsg.pending)) {
+            Object.assign(lastMsg, ui, { pending: false });
+          } else {
+            this.state.messages.push(ui);
+          }
           this._push();
         } else if (role === 'assistant') {
           this.state.curAssistant = { blocks: [] };
@@ -265,9 +395,9 @@ class PiPanel {
         } else if (ev.type === 'thinking_start') {
           blocks[idx] = blocks[idx] || { type: 'thinking', thinking: '' };
         } else if (ev.type === 'toolcall_start') {
-          blocks[idx] = blocks[idx] || { type: 'toolcall', id: '', name: '', args: '' };
+          blocks[idx] = blocks[idx] || { type: 'toolcall', id: '', name: '', args: '', output: '' };
         } else if (ev.type === 'toolcall_delta') {
-          const b = (blocks[idx] = blocks[idx] || { type: 'toolcall', id: '', name: '', args: '' });
+          const b = (blocks[idx] = blocks[idx] || { type: 'toolcall', id: '', name: '', args: '', output: '' });
           b.args += ev.delta || '';
         } else if (ev.type === 'toolcall_end') {
           const tc = ev.toolCall || {};
@@ -275,7 +405,8 @@ class PiPanel {
             type: 'toolcall',
             id: tc.id || '',
             name: tc.name || tc.toolName || 'tool',
-            args: JSON.stringify(tc.arguments ?? tc.input ?? {}),
+            args: typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments ?? tc.input ?? {}),
+            output: this.state.toolOutputs.get(tc.id) || '',
           };
         } else if (ev.type === 'text_end' || ev.type === 'thinking_end') {
           blocks[idx] = blocks[idx] || {};
@@ -295,13 +426,21 @@ class PiPanel {
           this.state.messages.push(ui);
           this.state.curAssistant = null;
         } else if (msg && msg.role === 'user') {
-          // 权威 user 消息（可能带图片等），替换最后一个 user 消息
+          // 权威 user 消息（可能带图片等），替换或完善对应的 user 消息
           const ui = normalizeMessage(msg);
+          let found = false;
           for (let i = this.state.messages.length - 1; i >= 0; i--) {
-            if (this.state.messages[i].role === 'user') {
-              this.state.messages[i] = ui;
-              break;
+            const m = this.state.messages[i];
+            if (m.role === 'user') {
+              if (!m.id || m.id === ui.id || m.text === ui.text || m.pending) {
+                this.state.messages[i] = Object.assign(m, ui, { done: true, pending: false });
+                found = true;
+                break;
+              }
             }
+          }
+          if (!found) {
+            this.state.messages.push(ui);
           }
         }
         this._push();
@@ -311,22 +450,72 @@ class PiPanel {
         this.state.toolOutputs.set(evt.toolCallId, '');
         if (this.state.curAssistant) {
           const blocks = this.state.curAssistant.blocks;
-          blocks.push({ type: 'toolcall', id: evt.toolCallId, name: evt.toolName, args: JSON.stringify(evt.args || {}) });
+          let exists = false;
+          for (const b of blocks) {
+            if (b.type === 'toolcall' && b.id === evt.toolCallId) {
+              exists = true;
+              break;
+            }
+          }
+          if (!exists) {
+            blocks.push({
+              type: 'toolcall',
+              id: evt.toolCallId,
+              name: evt.toolName,
+              args: typeof evt.args === 'string' ? evt.args : JSON.stringify(evt.args || {}),
+              output: '',
+            });
+          }
         }
         this._push();
         break;
       }
       case 'tool_execution_update': {
         const pr = evt.partialResult;
-        const text = pr && Array.isArray(pr.content) ? pr.content.map((c) => c.text || '').join('\n') : '';
-        if (text) this.state.toolOutputs.set(evt.toolCallId, text);
+        let text = '';
+        if (typeof pr === 'string') {
+          text = pr;
+        } else if (pr && Array.isArray(pr.content)) {
+          text = pr.content.map((c) => c.text || '').join('\n');
+        } else if (pr && typeof pr.text === 'string') {
+          text = pr.text;
+        }
+        if (text) {
+          this.state.toolOutputs.set(evt.toolCallId, text);
+          if (this.state.curAssistant) {
+            for (const b of this.state.curAssistant.blocks) {
+              if (b.type === 'toolcall' && b.id === evt.toolCallId) {
+                b.output = text;
+              }
+            }
+          }
+          for (const m of this.state.messages) {
+            for (const tc of m.toolCalls) {
+              if (tc.id === evt.toolCallId) tc.output = text;
+            }
+          }
+        }
         this._push();
         break;
       }
       case 'tool_execution_end': {
         const res = evt.result;
-        const text = res && Array.isArray(res.content) ? res.content.map((c) => c.text || '').join('\n') : '';
+        let text = '';
+        if (typeof res === 'string') {
+          text = res;
+        } else if (res && Array.isArray(res.content)) {
+          text = res.content.map((c) => c.text || '').join('\n');
+        } else if (res && typeof res.text === 'string') {
+          text = res.text;
+        }
         this.state.toolOutputs.set(evt.toolCallId, text);
+        if (this.state.curAssistant) {
+          for (const b of this.state.curAssistant.blocks) {
+            if (b.type === 'toolcall' && b.id === evt.toolCallId) {
+              b.output = text;
+            }
+          }
+        }
         // 同步到已完成的 assistant 消息里的卡片
         for (const m of this.state.messages) {
           for (const tc of m.toolCalls) {
@@ -395,7 +584,15 @@ class PiPanel {
 
   send(text) {
     if (!this.client || !text || !text.trim()) return;
-    this.state.messages.push({ role: 'user', text, thinking: '', toolCalls: [], done: true });
+    this.state.messages.push({
+      id: 'pending_' + Date.now(),
+      role: 'user',
+      text,
+      thinking: '',
+      toolCalls: [],
+      done: true,
+      pending: true,
+    });
     this._push();
     const streamingBehavior = this.state.status === 'streaming' ? 'followUp' : undefined;
     this.client.send({ type: 'prompt', message: text, ...(streamingBehavior ? { streamingBehavior } : {}) }).catch((e) => {
@@ -457,9 +654,10 @@ class PiPanel {
 
   switchDirectory(fsPath) {
     if (!fsPath) return;
+    const epoch = ++this.currentEpoch;
     // RPC 无切换目录命令：停止当前 pi 子进程，用新工作目录重启
     try {
-      this.client && this.client.stop();
+      if (this.client) this.client.stop();
     } catch {
       /* ignore */
     }
@@ -471,18 +669,22 @@ class PiPanel {
     this.state.status = 'starting';
     this.state.statusText = '正在切换工作目录并重启 Pi…';
     this._push();
-    this.start(fsPath);
+    this.start(fsPath, epoch);
     this.init();
   }
 
   async newSession() {
     if (!this.client) return;
-    this.state.messages = [];
-    this.state.curAssistant = null;
-    this.state.toolOutputs.clear();
-    this._push();
     try {
-      await this.client.send({ type: 'new_session' });
+      const res = await this.client.send({ type: 'new_session' });
+      if (res && res.data && res.data.cancelled) {
+        return;
+      }
+      this.state.messages = [];
+      this.state.curAssistant = null;
+      this.state.toolOutputs.clear();
+      this.state.statusText = '';
+      this._push();
     } catch (e) {
       this.state.statusText = '新会话失败: ' + e.message;
       this._push();
@@ -528,9 +730,35 @@ class PiPanel {
       .send({ type: 'get_messages' })
       .then((res) => {
         if (res.success && Array.isArray(res.data.messages)) {
-          this.state.messages = res.data.messages
-            .filter((m) => m && m.role !== 'toolResult')
-            .map((m) => normalizeMessage(m));
+          const rawMsgs = res.data.messages;
+          const toolResultMap = new Map();
+          for (const m of rawMsgs) {
+            if (!m) continue;
+            if (m.role === 'toolResult') {
+              const toolCallId = m.toolCallId || m.toolUseId || '';
+              const text = (Array.isArray(m.content) ? m.content : (typeof m.content === 'string' ? [{ text: m.content }] : []))
+                .map((c) => (c && c.text) || '')
+                .join('\n');
+              if (toolCallId) {
+                toolResultMap.set(toolCallId, text);
+                this.state.toolOutputs.set(toolCallId, text);
+              }
+            }
+          }
+          const uiMsgs = [];
+          for (const m of rawMsgs) {
+            if (!m || m.role === 'toolResult') continue;
+            const ui = normalizeMessage(m);
+            if (ui.role === 'assistant' && Array.isArray(ui.toolCalls)) {
+              for (const tc of ui.toolCalls) {
+                if (!tc.output && toolResultMap.has(tc.id)) {
+                  tc.output = toolResultMap.get(tc.id);
+                }
+              }
+            }
+            uiMsgs.push(ui);
+          }
+          this.state.messages = uiMsgs;
           this.state.curAssistant = null;
           this._push();
         }
@@ -546,11 +774,11 @@ class PiPanel {
   }
 
   _push() {
-    if (!this.webviewView) return;
+    if (this.webviews.size === 0) return;
     const s = this.state;
     const list = s.messages.slice();
     if (s.curAssistant) list.push(blockToUiMessage(s.curAssistant.blocks));
-    this.webviewView.webview.postMessage({
+    const payload = {
       type: 'state',
       payload: {
         status: s.status,
@@ -565,7 +793,14 @@ class PiPanel {
         contextUsage: s.contextUsage,
         messages: list,
       },
-    });
+    };
+    for (const view of this.webviews) {
+      try {
+        view.webview.postMessage(payload);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 }
 
@@ -576,7 +811,7 @@ const panel = new PiPanel();
 
 class PiChatViewProvider {
   resolveWebviewView(webviewView) {
-    panel.webviewView = webviewView;
+    panel.addWebview(webviewView);
     webviewView.webview.options = { enableScripts: true };
     webviewView.webview.html = getHtml();
 
@@ -687,11 +922,20 @@ function getHtml() {
   .msg.user .bubble { background: var(--vscode-editor-selectionBackground, rgba(120,120,120,.2)); }
   .msg.assistant .bubble { background: transparent; }
   .thinking { margin: 4px 0; padding: 6px 8px; border-left: 3px solid var(--vscode-textBlockQuote-border); color: var(--vscode-descriptionForeground); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .textbody { white-space: pre-wrap; word-break: break-word; }
+  .codeblock { margin: 6px 0; border: 1px solid var(--vscode-panel-border); border-radius: 6px; overflow: hidden; background: var(--vscode-editor-background); }
+  .codehead { display: flex; justify-content: space-between; align-items: center; padding: 3px 8px; font-size: 11px; color: var(--vscode-descriptionForeground); background: var(--vscode-sideBarSectionHeader-background); border-bottom: 1px solid var(--vscode-panel-border); }
+  .codehead button { font-size: 10px; padding: 1px 6px; background: transparent; border: 1px solid var(--vscode-panel-border); color: var(--vscode-foreground); border-radius: 3px; cursor: pointer; }
+  .codehead button:hover { background: var(--vscode-button-hoverBackground); color: var(--vscode-button-foreground); }
+  .codeblock pre { margin: 0; padding: 8px; overflow-x: auto; font-family: var(--vscode-editor-font-family); font-size: 12px; }
+  .codeblock code { font-family: inherit; }
+  code.inline { background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.15)); padding: 2px 4px; border-radius: 3px; font-family: var(--vscode-editor-font-family); font-size: 12px; }
+  .errmsg { margin: 4px 0; padding: 6px 8px; border-left: 3px solid var(--vscode-errorForeground); color: var(--vscode-errorForeground); font-size: 12px; background: rgba(241, 76, 76, 0.1); border-radius: 0 4px 4px 0; }
   .toolcard { margin: 4px 0; border: 1px solid var(--vscode-panel-border); border-radius: 6px; overflow: hidden; }
   .toolcard summary { padding: 6px 8px; cursor: pointer; color: var(--vscode-textLink-foreground); font-family: var(--vscode-editor-font-family); font-size: 12px; }
   .toolcard .toolbody { padding: 6px 8px; border-top: 1px solid var(--vscode-panel-border); white-space: pre-wrap; word-break: break-word; font-family: var(--vscode-editor-font-family); font-size: 11px; max-height: 300px; overflow: auto; color: var(--vscode-descriptionForeground); }
   .error { color: var(--vscode-errorForeground); white-space: pre-wrap; word-break: break-word; }
-  .empty { color: var(--vscode-descriptionForeground); text-align: center; margin-top: 40px; font-size: 12px; }
+  .empty { color: var(--vscode-descriptionForeground); text-align: center; margin-top: 40px; font-size: 12px; line-height: 1.6; }
   #inputbar { position: fixed; bottom: 0; left: 0; right: 0; padding: 8px 12px; border-top: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); display: flex; flex-direction: column; gap: 6px; }
   #ta { width: 100%; min-height: 40px; max-height: 140px; resize: none; border: 1px solid var(--vscode-input-border, transparent); background: var(--vscode-input-background); color: var(--vscode-input-foreground); border-radius: 4px; padding: 6px 8px; font-family: inherit; font-size: 13px; }
   #ta:focus { outline: 1px solid var(--vscode-focusBorder); }
@@ -740,6 +984,8 @@ function getHtml() {
       news: document.getElementById('btnNew'),
     };
 
+    let currentStatus = 'starting';
+
     function esc(s) {
       return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
@@ -750,14 +996,122 @@ function getHtml() {
 
     function basename(p) {
       const s = String(p || '');
-      const parts = s.replace(/[\\/]+$/, '').split(/[\\/]/);
+      const parts = s.replace(/[\\\\/]+$/, '').split(/[\\\\/]/);
       return parts[parts.length - 1] || s;
     }
+
+    function formatMarkdown(raw) {
+      if (!raw) return '';
+      const codeBlocks = [];
+      let text = raw.replace(/\`\`\`([a-zA-Z0-9_-]*)\\r?\\n([\\s\\S]*?)\`\`\`/g, function(_, lang, code) {
+        const idx = codeBlocks.length;
+        const langLabel = lang ? esc(lang) : 'code';
+        const codeEscaped = esc(code.replace(/\\r?\\n$/, ''));
+        codeBlocks.push(
+          '<div class="codeblock"><div class="codehead"><span>' +
+            langLabel +
+            '</span><button class="copybtn" type="button">复制</button></div><pre><code>' +
+            codeEscaped +
+            '</code></pre></div>'
+        );
+        return '%%CODEBLOCK_' + idx + '%%';
+      });
+      text = esc(text);
+      text = text.replace(/\`([^\`\\n]+)\`/g, '<code class="inline">$1</code>');
+      text = text.replace(/\\*\\*([^\\*\\n]+)\\*\\*/g, '<strong>$1</strong>');
+      text = text.replace(/%%CODEBLOCK_(\\d+)%%/g, function(_, idx) {
+        return codeBlocks[Number(idx)] || '';
+      });
+      return text;
+    }
+
+    function isNearBottom() {
+      const threshold = 60;
+      return el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight <= threshold;
+    }
+
+    function renderMessages(msgs, errorDetail) {
+      if (msgs.length === 0 && !errorDetail) {
+        el.messages.innerHTML = '<div class="empty">向 Pi 提问，开始编码会话。<br>可在下方切换工作目录、模型与推理强度。<br>快捷键：Enter 发送，Shift+Enter 换行。</div>';
+        return;
+      }
+
+      const emptyEl = el.messages.querySelector('.empty');
+      if (emptyEl) emptyEl.remove();
+
+      const wasNearBottom = isNearBottom();
+
+      const currentMsgEls = Array.from(el.messages.querySelectorAll('.msg'));
+      if (currentMsgEls.length > msgs.length) {
+        for (let i = msgs.length; i < currentMsgEls.length; i++) {
+          currentMsgEls[i].remove();
+        }
+        currentMsgEls.length = msgs.length;
+      }
+
+      msgs.forEach((m, idx) => {
+        let msgEl = currentMsgEls[idx];
+        const isUser = m.role === 'user';
+        const expectedClass = 'msg ' + (isUser ? 'user' : 'assistant');
+        if (!msgEl) {
+          msgEl = document.createElement('div');
+          msgEl.className = expectedClass;
+          msgEl.setAttribute('data-idx', String(idx));
+          el.messages.appendChild(msgEl);
+        } else if (msgEl.className !== expectedClass) {
+          msgEl.className = expectedClass;
+        }
+
+        let inner = '';
+        if (isUser) {
+          inner = '<div class="bubble">' + esc(m.text) + '</div>';
+        } else {
+          inner = '<div class="bubble">';
+          if (m.thinking) inner += '<div class="thinking">' + esc(m.thinking) + '</div>';
+          if (m.text) inner += '<div class="textbody">' + formatMarkdown(m.text) + '</div>';
+          for (const tc of m.toolCalls || []) {
+            inner += '<details class="toolcard" open><summary>🛠 ' + esc(tc.name || 'tool');
+            if (tc.args) inner += ' · ' + esc(shortArgs(tc.args));
+            inner += '</summary>';
+            if (tc.output) inner += '<div class="toolbody">' + esc(tc.output) + '</div>';
+            inner += '</details>';
+          }
+          if (m.errorMessage) inner += '<div class="errmsg">⚠️ ' + esc(m.errorMessage) + '</div>';
+          inner += '</div>';
+        }
+
+        if (msgEl.innerHTML !== inner) {
+          msgEl.innerHTML = inner;
+        }
+      });
+
+      let errEl = el.messages.querySelector('.error');
+      if (errorDetail) {
+        if (!errEl) {
+          errEl = document.createElement('div');
+          errEl.className = 'error';
+          el.messages.appendChild(errEl);
+        }
+        if (errEl.textContent !== errorDetail) {
+          errEl.textContent = errorDetail;
+        }
+      } else if (errEl) {
+        errEl.remove();
+      }
+
+      if (wasNearBottom) {
+        el.messages.scrollTop = el.messages.scrollHeight;
+      }
+    }
+
     function render(payload) {
-      el.dot.className = payload.status || 'idle';
+      currentStatus = payload.status || 'idle';
+      el.dot.className = currentStatus;
       el.status.textContent = payload.statusText || '';
-      el.send.disabled = payload.status === 'streaming';
-      el.stop.disabled = payload.status !== 'streaming';
+      const canSend = currentStatus === 'idle';
+      el.send.disabled = !canSend;
+      el.stop.disabled = currentStatus !== 'streaming';
+
       // 工作目录下拉（底部）
       const dirs = payload.directories || [];
       let dOpts = '';
@@ -766,6 +1120,7 @@ function getHtml() {
       }
       el.dirSel.innerHTML = dOpts;
       el.dirSel.disabled = dirs.length === 0;
+
       // 模型下拉（底部，显示简短 label 而非全称，参考 pi-web）
       const curModel = payload.model || '';
       const models = payload.models || [];
@@ -777,6 +1132,7 @@ function getHtml() {
       }
       el.modelSel.innerHTML = mOpts;
       el.modelSel.disabled = models.length === 0;
+
       // 上下文使用情况（pi-web 风格纯文字：percent% / 格式化窗口，按使用率变色）
       const ctx = payload.contextUsage;
       if (ctx && ctx.contextWindow) {
@@ -790,6 +1146,7 @@ function getHtml() {
       } else {
         el.ctx.style.display = 'none';
       }
+
       // 推理强度下拉（底部）
       const cur = payload.thinkingLevel || '';
       const levels = payload.availableLevels || [];
@@ -800,31 +1157,7 @@ function getHtml() {
       el.thinkSel.innerHTML = opts;
       el.thinkSel.disabled = levels.length === 0;
 
-      const msgs = payload.messages || [];
-      let html = '';
-      if (msgs.length === 0) {
-        html = '<div class="empty">向 Pi 提问，开始编码会话。<br>支持 /model、/new、/resume 等命令。</div>';
-      }
-      for (const m of msgs) {
-        if (m.role === 'user') {
-          html += '<div class="msg user"><div class="bubble">' + esc(m.text) + '</div></div>';
-          continue;
-        }
-        html += '<div class="msg assistant"><div class="bubble">';
-        if (m.thinking) html += '<div class="thinking">' + esc(m.thinking) + '</div>';
-        if (m.text) html += esc(m.text);
-        for (const tc of m.toolCalls || []) {
-          html += '<details class="toolcard" open><summary>🛠 ' + esc(tc.name || 'tool');
-          if (tc.args) html += ' · ' + esc(shortArgs(tc.args));
-          html += '</summary>';
-          if (tc.output) html += '<div class="toolbody">' + esc(tc.output) + '</div>';
-          html += '</details>';
-        }
-        html += '</div></div>';
-      }
-      if (payload.errorDetail) html += '<div class="error">' + esc(payload.errorDetail) + '</div>';
-      el.messages.innerHTML = html;
-      el.messages.scrollTop = el.messages.scrollHeight;
+      renderMessages(payload.messages || [], payload.errorDetail);
     }
 
     window.addEventListener('message', (e) => {
@@ -832,12 +1165,46 @@ function getHtml() {
       if (msg && msg.type === 'state') render(msg.payload);
     });
 
+    el.messages.addEventListener('click', function(e) {
+      const btn = e.target && e.target.closest('.copybtn');
+      if (!btn) return;
+      const block = btn.closest('.codeblock');
+      const codeEl = block ? block.querySelector('pre code') : null;
+      if (!codeEl) return;
+      const text = codeEl.innerText || codeEl.textContent || '';
+      const onCopied = () => {
+        const old = btn.textContent;
+        btn.textContent = '已复制';
+        setTimeout(() => { btn.textContent = old; }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(onCopied).catch(fallback);
+      } else {
+        fallback();
+      }
+      function fallback() {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand('copy');
+          onCopied();
+        } catch (_) {}
+        document.body.removeChild(ta);
+      }
+    });
+
     function send() {
+      if (currentStatus !== 'idle') return;
       const text = el.ta.value;
       if (!text.trim()) return;
       el.ta.value = '';
       vscode.postMessage({ command: 'send', text });
     }
+
     el.send.addEventListener('click', send);
     el.stop.addEventListener('click', () => vscode.postMessage({ command: 'abort' }));
     el.news.addEventListener('click', () => vscode.postMessage({ command: 'newSession' }));
@@ -856,7 +1223,9 @@ function getHtml() {
     el.ta.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
-        send();
+        if (currentStatus === 'idle') {
+          send();
+        }
       }
     });
 
@@ -867,4 +1236,4 @@ function getHtml() {
 </html>`;
 }
 
-module.exports = { activate, deactivate };
+module.exports = { activate, deactivate, PiPanel, PiRpcClient, normalizeMessage, getHtml };

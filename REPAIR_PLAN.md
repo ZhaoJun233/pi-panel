@@ -151,26 +151,26 @@ switchDirectory(newPath):
 ## 4. 分步骤实施清单 (Step-by-Step Milestones)
 
 ### 阶段一：RPC 协议层加固 (`PiRpcClient`)
-- [ ] **M1.1 编码修复**：集成 `StringDecoder`，修复 UTF-8 中文多字节切片乱码。
-- [ ] **M1.2 异常与超时治理**：为 `send()` 引入超时控制（默认 30 秒，可针对 prompt 特殊处理）；在进程退出（`exit`）及报错时遍历并拒绝（`reject`）全部未决请求，清空 `pending` Map。
-- [ ] **M1.3 进程安全退出**：Windows 平台支持树形强制销毁保障，避免僵尸进程。
+- [x] **M1.1 编码修复**：集成 `StringDecoder`，修复 UTF-8 中文多字节切片乱码。
+- [x] **M1.2 异常与超时治理**：为 `send()` 引入超时控制（默认 30 秒，可针对 prompt 特殊处理）；在进程退出（`exit`）及报错时遍历并拒绝（`reject`）全部未决请求，清空 `pending` Map。
+- [x] **M1.3 进程安全退出**：Windows 平台支持树形强制销毁保障，避免僵尸进程。
 
 ### 阶段二：控制器与状态机修复 (`PiPanel`)
-- [ ] **M2.1 引入 Epoch 机制**：重构 `switchDirectory()` 与 `start()`，隔离不同代次进程的事件。
-- [ ] **M2.2 会话切换原子性**：重写 `newSession()`，等待 RPC 明确成功且 `data.cancelled !== true` 后再执行本地视图和历史重置。
-- [ ] **M2.3 消息归一化扩充**：`normalizeMessage()` 增加对 `typeof content === 'string'` 的正规解析；保留 `errorMessage` 与 `stopReason` 并上屏展示。
-- [ ] **M2.4 状态同步与刷新**：在 `get_state` 成功返回后，若当前处于 `starting` 状态，自动回正为 `idle`；并在每次 `agent_settled` 后自动拉取最新的 `get_session_stats` 刷新 Context 状态。
-- [ ] **M2.5 工具历史数据持久化**：重写 `init()` 中对 `get_messages` 的处理，正确将 `toolResult` 关联到对应的 `toolCall`。
+- [x] **M2.1 引入 Epoch 机制**：重构 `switchDirectory()` 与 `start()`，隔离不同代次进程的事件。
+- [x] **M2.2 会话切换原子性**：重写 `newSession()`，等待 RPC 明确成功且 `data.cancelled !== true` 后再执行本地视图和历史重置。
+- [x] **M2.3 消息归一化扩充**：`normalizeMessage()` 增加对 `typeof content === 'string'` 的正规解析；保留 `errorMessage` 与 `stopReason` 并上屏展示。
+- [x] **M2.4 状态同步与刷新**：在 `get_state` 成功返回后，若当前处于 `starting` 状态，自动回正为 `idle`；并在每次 `agent_settled` 后自动拉取最新的 `get_session_stats` 刷新 Context 状态。
+- [x] **M2.5 工具历史数据持久化**：重写 `init()` 中对 `get_messages` 的处理，正确将 `toolResult` 关联到对应的 `toolCall`。
 
 ### 阶段三：Webview 前端体验与健壮性改造
-- [ ] **M3.1 路径解析修复**：修正客户端内联 JavaScript 中的正则表达式转义问题，确保 Windows 盘符路径能准确展示目录名称。
-- [ ] **M3.2 交互逻辑与键盘校验统一**：在 `keydown` 事件中同步校验 `status !== 'idle'`，阻止在未就绪或生成中的不合规发送。
-- [ ] **M3.3 智能按需滚动与局部渲染**：实现 DOM 局部差量填充，移除全量 `innerHTML` 暴力重排，加入 `isNearBottom` 视口保护。
-- [ ] **M3.4 基础排版与 Markdown 代码高亮优化**：引入安全轻量的代码块格式化支持，提供一键复制代码块能力。
+- [x] **M3.1 路径解析修复**：修正客户端内联 JavaScript 中的正则表达式转义问题，确保 Windows 盘符路径能准确展示目录名称。
+- [x] **M3.2 交互逻辑与键盘校验统一**：在 `keydown` 事件中同步校验 `status !== 'idle'`，阻止在未就绪或生成中的不合规发送。
+- [x] **M3.3 智能按需滚动与局部渲染**：实现 DOM 局部差量填充，移除全量 `innerHTML` 暴力重排，加入 `isNearBottom` 视口保护。
+- [x] **M3.4 基础排版与 Markdown 代码高亮优化**：引入安全轻量的代码块格式化支持，提供一键复制代码块能力。
 
 ### 阶段四：多视图架构与 VS Code 契约完善
-- [ ] **M4.1 多 Webview 同步机制**：将 `PiPanel.webviewView` 改为 `Set<WebviewView>`，在主侧边栏与辅助侧边栏同时挂载时，向所有活动视图统一广播状态变更。
-- [ ] **M4.2 命令与空状态文案对齐**：修正空状态文案中对不支持命令的误导提示，增加规范的快捷操作引导。
+- [x] **M4.1 多 Webview 同步机制**：将 `PiPanel.webviewView` 改为 `Set<WebviewView>`，在主侧边栏与辅助侧边栏同时挂载时，向所有活动视图统一广播状态变更。
+- [x] **M4.2 命令与空状态文案对齐**：修正空状态文案中对不支持命令的误导提示，增加规范的快捷操作引导。
 
 ---
 
